@@ -45,7 +45,7 @@ final class PhotoView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let owner = owner else { return nil }
         let p = convert(point, from: superview)
-        return owner.contains(viewPoint: p, in: bounds) ? self : nil
+        return owner.contains(viewPoint: p) ? self : nil
     }
 
     override func mouseDown(with event: NSEvent) { owner?.mouseDown(event) }
@@ -62,7 +62,10 @@ final class PhotoView: NSView {
         }
     }
 
-    override func menu(for event: NSEvent) -> NSMenu? { owner?.makeMenu() }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        owner?.bringToFront(nil)                // right-clicking a photo lifts it off the pile
+        return owner?.makeMenu()
+    }
 
     // Drop more images onto a photo to pin them too
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
@@ -86,6 +89,8 @@ final class PhotoController: NSObject {
     var isDragging = false
     var lastAngle: CGFloat = 0
     var lastEventTime: TimeInterval = 0
+    /// How far a photo may lean against the pile. It tips and swings, but never turns over.
+    let swingLimit: CGFloat = 55 * .pi / 180
 
     // Layers: frameLayer (rotates, has the shadow) > contentLayer (the image) > holeLayer (pin hole)
     let frameLayer = CALayer()
@@ -101,14 +106,18 @@ final class PhotoController: NSObject {
         size = s
         baseSize = s
 
+        // The pin goes in along the top edge, so a photo hangs from it instead of being
+        // skewered through the middle
+        let topInset = min(12, s.height * 0.4)
+        let hang = -(s.height / 2 - topInset)
         if isFirst {
-            r0 = CGPoint(x: 0, y: -0.12 * s.height)
+            r0 = CGPoint(x: 0, y: hang)
             theta = 0
         } else {
-            // The pin always goes through the photo, a little off-centre, with a slight tilt
-            r0 = CGPoint(x: CGFloat.random(in: -0.22...0.22) * s.width,
-                         y: CGFloat.random(in: -0.22...0.22) * s.height)
-            theta = CGFloat.random(in: -0.16...0.16)
+            // Along the same top edge, a little off-centre, with a slight tilt
+            r0 = CGPoint(x: CGFloat.random(in: -0.18...0.18) * s.width,
+                         y: hang + CGFloat.random(in: -4...4))
+            theta = CGFloat.random(in: -0.12...0.12)
         }
 
         panel = PinPanel(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
@@ -162,15 +171,21 @@ final class PhotoController: NSObject {
     /// Places the window and rotates the photo so it hangs from the pin.
     func layout() {
         let side = hypot(size.width, size.height) + 40
-        let pin = host?.pinPoint ?? .zero
-        let c = pin + r0.rotated(by: theta)
+        let pin = host?.needlePoint ?? .zero
+        let r = r0.rotated(by: theta)
+        let c = pin + r
         let frame = NSRect(x: c.x - side / 2, y: c.y - side / 2, width: side, height: side)
         if panel.frame != frame { panel.setFrame(frame, display: false) }
+
+        // A window can only sit on whole pixels, so the frame is as close as the screen
+        // allows. Hang the photo off the pin as the window actually landed — otherwise the
+        // hole slides off the needle as the photo swings.
+        let origin = panel.frame.origin
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         frameLayer.bounds = CGRect(origin: .zero, size: size)
-        frameLayer.position = CGPoint(x: side / 2, y: side / 2)
+        frameLayer.position = CGPoint(x: pin.x - origin.x + r.x, y: pin.y - origin.y + r.y)
         frameLayer.setAffineTransform(CGAffineTransform(rotationAngle: theta))
         contentLayer.frame = frameLayer.bounds
         // The pin sits at (-r0) from the photo's centre, in the photo's own axes
@@ -178,9 +193,9 @@ final class PhotoController: NSObject {
         CATransaction.commit()
     }
 
-    func contains(viewPoint p: CGPoint, in bounds: CGRect) -> Bool {
-        let c = CGPoint(x: bounds.midX, y: bounds.midY)
-        let q = (p - c).rotated(by: -theta)
+    func contains(viewPoint p: CGPoint) -> Bool {
+        // frameLayer.position is the photo's centre, wherever the window let us put it
+        let q = (p - frameLayer.position).rotated(by: -theta)
         return abs(q.x) <= size.width / 2 && abs(q.y) <= size.height / 2
     }
 
@@ -198,6 +213,8 @@ final class PhotoController: NSObject {
         omega = clamp(omega, 15)
         if abs(omega) < 0.002 { omega = 0 }
         theta += omega * dt
+        if theta > swingLimit { theta = swingLimit; omega = 0 }
+        if theta < -swingLimit { theta = -swingLimit; omega = 0 }
     }
 
     // MARK: mouse — grab a photo and swing it around the pin
@@ -208,9 +225,14 @@ final class PhotoController: NSObject {
         return atan2(m.y - p.y, m.x - p.x)
     }
 
-    func mouseDown(_ e: NSEvent) {
+    /// Lifts this photo above the others; the pin stays on top of everything.
+    @objc func bringToFront(_ sender: Any?) {
         panel.orderFrontRegardless()
         host?.bringPinToFront()
+    }
+
+    func mouseDown(_ e: NSEvent) {
+        bringToFront(nil)
         isDragging = true
         omega = 0
         lastAngle = angleToPin()
@@ -227,6 +249,8 @@ final class PhotoController: NSObject {
         omega = omega * 0.5 + CGFloat(Double(d) / dt) * 0.5
         lastAngle = a
         lastEventTime = e.timestamp
+        if theta > swingLimit { theta = swingLimit; omega = 0 }
+        if theta < -swingLimit { theta = -swingLimit; omega = 0 }
         layout()
     }
 
@@ -252,6 +276,11 @@ final class PhotoController: NSObject {
 
     func makeMenu() -> NSMenu {
         let menu = NSMenu()
+        let front = NSMenuItem(title: "Bring to Front", action: #selector(bringToFront(_:)), keyEquivalent: "")
+        front.target = self
+        menu.addItem(front)
+        menu.addItem(.separator())
+
         let opacity = NSMenuItem(title: "Opacity", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         for pct in [100, 75, 50, 25] {
@@ -312,6 +341,7 @@ final class PinHeadView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.clear(bounds)      // clear panel: wipe the last needle before the next
 
         // Needle: silver, casting a short shadow onto the photo it goes into
         ctx.saveGState()
@@ -346,7 +376,7 @@ final class PinHeadView: NSView {
 
 // MARK: - Transparent drop target laid over the menu bar button / used in the drop zone
 
-final class DropView: NSView {
+class DropView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         registerForDraggedTypes([.fileURL, .tiff, .png])
@@ -366,8 +396,97 @@ final class DropView: NSView {
     override var mouseDownCanMoveWindow: Bool { !(superview is NSButton) }
 }
 
+// MARK: - The drop zone: a small pile of photos with the pin in at the top of the pile
+
+final class DropZoneView: DropView {
+    /// The top photo of the pile.
+    private var card: CGRect {
+        let w: CGFloat = 104, h: CGFloat = 64
+        return CGRect(x: bounds.midX - w / 2, y: 42, width: w, height: h)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.clear(bounds)
+
+        // The plate the target sits on
+        let plate = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 16, yRadius: 16)
+        NSColor.windowBackgroundColor.withAlphaComponent(0.94).setFill()
+        plate.fill()
+        NSColor.systemOrange.setStroke()
+        plate.lineWidth = 2
+        plate.stroke()
+
+        // The pile, oldest photo furthest back
+        drawCard(card.offsetBy(dx: -4, dy: 3), angle: -6, in: ctx)
+        drawCard(card.offsetBy(dx: 3, dy: -1), angle: 3.5, in: ctx)
+
+        // The pin goes into the top edge of the top photo — at the top of the pile,
+        // never in the middle of it
+        let tip = CGPoint(x: card.midX, y: card.maxY - 3)
+        let head = CGPoint(x: tip.x, y: 130)
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 1, height: -2), blur: 3,
+                      color: NSColor.black.withAlphaComponent(0.4).cgColor)
+        ctx.setStrokeColor(NSColor(white: 0.86, alpha: 1).cgColor)
+        ctx.setLineWidth(2.2)
+        ctx.setLineCap(.round)
+        ctx.move(to: head)
+        ctx.addLine(to: tip)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        drawCard(card, angle: 0, in: ctx)          // the top photo hides the needle below its edge
+        drawHead(at: head, in: ctx)
+
+        // Caption, under the pile
+        let caption = NSAttributedString(string: "Drop photos to pin", attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+        let s = caption.size()
+        caption.draw(at: NSPoint(x: bounds.midX - s.width / 2, y: 12))
+    }
+
+    private func drawCard(_ rect: CGRect, angle: CGFloat, in ctx: CGContext) {
+        ctx.saveGState()
+        ctx.translateBy(x: rect.midX, y: rect.midY)
+        ctx.rotate(by: angle * .pi / 180)
+        ctx.translateBy(x: -rect.midX, y: -rect.midY)
+        ctx.setShadow(offset: CGSize(width: 0, height: -2), blur: 6,
+                      color: NSColor.black.withAlphaComponent(0.28).cgColor)
+        NSColor.white.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+        ctx.setShadow(offset: .zero, blur: 0, color: NSColor.clear.cgColor)
+        NSColor.black.withAlphaComponent(0.12).setStroke()
+        let edge = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+        edge.lineWidth = 0.5
+        edge.stroke()
+        ctx.restoreGState()
+    }
+
+    private func drawHead(at head: CGPoint, in ctx: CGContext) {
+        let ball = NSRect(x: head.x - 10, y: head.y - 10, width: 20, height: 20)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 2, height: -4), blur: 5,
+                      color: NSColor.black.withAlphaComponent(0.35).cgColor)
+        NSColor(calibratedRed: 0.8, green: 0.1, blue: 0.12, alpha: 1).setFill()
+        NSBezierPath(ovalIn: ball).fill()
+        ctx.restoreGState()
+
+        let gradient = NSGradient(
+            starting: NSColor(calibratedRed: 1.0, green: 0.5, blue: 0.45, alpha: 1),
+            ending: NSColor(calibratedRed: 0.62, green: 0.04, blue: 0.08, alpha: 1))
+        gradient?.draw(in: NSBezierPath(ovalIn: ball), relativeCenterPosition: NSPoint(x: -0.4, y: 0.4))
+        NSColor.white.withAlphaComponent(0.75).setFill()
+        NSBezierPath(ovalIn: NSRect(x: head.x - 6, y: head.y + 1.5, width: 5.5, height: 3.8)).fill()
+    }
+}
+
 func makeDropZone() -> NSPanel {
-    let panel = PinPanel(contentRect: NSRect(x: 0, y: 0, width: 150, height: 120),
+    let size = NSSize(width: 168, height: 156)
+    let panel = PinPanel(contentRect: NSRect(origin: .zero, size: size),
                          styleMask: [.borderless, .nonactivatingPanel],
                          backing: .buffered, defer: false)
     panel.level = .floating
@@ -380,24 +499,12 @@ func makeDropZone() -> NSPanel {
     panel.backgroundColor = .clear
     panel.hasShadow = true
 
-    let zone = DropView(frame: NSRect(x: 0, y: 0, width: 150, height: 120))
-    zone.wantsLayer = true
-    zone.layer?.cornerRadius = 14
-    zone.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
-    zone.layer?.borderWidth = 2
-    zone.layer?.borderColor = NSColor.systemOrange.cgColor
-
-    let label = NSTextField(labelWithString: "📌\nDrop photos\nto pin")
-    label.alignment = .center
-    label.font = .systemFont(ofSize: 15, weight: .medium)
-    label.maximumNumberOfLines = 3
-    label.frame = zone.bounds.insetBy(dx: 8, dy: 14)
-    label.autoresizingMask = [.width, .height]
-    zone.addSubview(label)
-
+    let zone = DropZoneView(frame: NSRect(origin: .zero, size: size))
+    zone.autoresizingMask = [.width, .height]
     panel.contentView = zone
+
     if let screen = NSScreen.main?.visibleFrame {
-        panel.setFrameOrigin(NSPoint(x: screen.maxX - 170, y: screen.minY + 20))
+        panel.setFrameOrigin(NSPoint(x: screen.maxX - size.width - 20, y: screen.minY + 20))
     }
     return panel
 }
@@ -408,6 +515,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // With SwiftUI's @NSApplicationDelegateAdaptor, NSApp.delegate is SwiftUI's own wrapper,
     // so `NSApp.delegate as? AppDelegate` is nil. Use this instead.
     static weak var shared: AppDelegate?
+
+    /// One level above the photos, so a photo brought forward can never cover the pin.
+    static let pinLevel = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
 
     override init() {
         super.init()
@@ -426,6 +536,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pinAccel = CGPoint.zero
     var stackPin: PinPanel?
     var timer: Timer?
+
+    /// Where the needle tip really is. Its window can only sit on whole pixels, so the
+    /// photos hang from this instead of from `pinPoint`, and the hole stays on the needle.
+    var needlePoint: CGPoint {
+        guard let origin = stackPin?.frame.origin else { return pinPoint }
+        return CGPoint(x: origin.x + 40, y: origin.y + 40)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
@@ -506,7 +623,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    func bringPinToFront() { stackPin?.orderFrontRegardless() }
+    func bringPinToFront() {
+        guard let pin = stackPin else { return }
+        pin.level = Self.pinLevel                  // in case anything reset it to `.floating`
+        pin.orderFrontRegardless()
+        pin.contentView?.needsDisplay = true     // a clear panel must not come back blank
+    }
 
     // MARK: the pin window
 
@@ -516,8 +638,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let p = PinPanel(contentRect: NSRect(x: 0, y: 0, width: side, height: side),
                              styleMask: [.borderless, .nonactivatingPanel],
                              backing: .buffered, defer: false)
-            p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
-            p.isFloatingPanel = true
+            p.isFloatingPanel = true        // this resets the level, so set the level after it
+            p.level = Self.pinLevel
             p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             p.isOpaque = false
@@ -528,17 +650,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let head = PinHeadView(frame: NSRect(x: 0, y: 0, width: side, height: side))
             head.onDrag = { [weak self] dx, dy in
                 guard let self = self else { return }
-                self.pinTarget = CGPoint(x: self.pinTarget.x + dx, y: self.pinTarget.y + dy)
+                self.pinTarget = self.onScreen(CGPoint(x: self.pinTarget.x + dx,
+                                                       y: self.pinTarget.y + dy))
             }
             p.contentView = head
             stackPin = p
         }
         placePinWindow()
-        stackPin?.orderFrontRegardless()
+        bringPinToFront()
     }
 
     private func placePinWindow() {
         stackPin?.setFrameOrigin(NSPoint(x: pinPoint.x - 40, y: pinPoint.y - 40))
+    }
+
+    /// Keeps the pin on a screen. Its head sits 15 pt above the needle, so a pin dragged
+    /// past the edge had no visible part left to grab — it was simply gone.
+    private func onScreen(_ p: CGPoint) -> CGPoint {
+        let screen = NSScreen.screens.first { $0.frame.contains(p) } ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return p }
+        return CGPoint(x: min(max(p.x, visible.minX + 30), visible.maxX - 30),
+                       y: min(max(p.y, visible.minY + 30), visible.maxY - 30))
     }
 
     // MARK: physics loop
@@ -566,12 +698,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pinAccel = CGPoint(x: clamp(pinAccel.x, 20000), y: clamp(pinAccel.y, 20000))
 
         let moved = (pinPoint - old).length > 0.001
+        if moved { placePinWindow() }        // move the pin first, then hang the photos off it
         for p in pins {
             let before = p.omega
             p.step(dt: dt, pinAccel: pinAccel)
             if moved || before != 0 || p.omega != 0 { p.layout() }
         }
-        if moved { placePinWindow() }
     }
 
     // MARK: menu actions
